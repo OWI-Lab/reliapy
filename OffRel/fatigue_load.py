@@ -80,12 +80,12 @@ class LongtermLoad:
         Compute fatigue damage for a Weibull-distributed stress range 
         Parameters
         ----------
+        n_cycles : float
+            Number of stress cycles to calculate damage as Number of Years * Cycles per Year; cycles per year = 3600*24*365/mean period.    
         q : float
             Weibull scale parameter.
         h : float
-            Weibull shape parameter.
-        n_cycles : float
-            Number of stress cycles to calculate damage as Number of Years * Cycles per Year; cycles per year = 3600*24*365/mean period.    
+            Weibull shape parameter (default 0.8).
         Returns
         -------
         damage : float or ndarray
@@ -128,7 +128,7 @@ class LongtermLoad:
 
         Returns
         -------
-        q : float
+        q_estimated : float
             Estimated Weibull scale parameter for the long-term load distribution.
         """
         
@@ -152,7 +152,7 @@ class LongtermLoad:
             List of DLC simulation results, where each dict contains 'time' and 'stress' arrays.
         Returns
         -------
-        q : float
+        q_estimated : float
             Estimated Weibull scale parameter for the long-term load distribution.
         """
         pass  # Placeholder for future implementation using DLC simulation data
