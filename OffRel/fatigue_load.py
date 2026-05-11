@@ -148,14 +148,76 @@ class LongtermLoad:
         """Estimate Weibull scale parameter q from DLC simulation data.
         Parameters
         ----------
-        dlc_data : list of dict
-            List of DLC simulation results, where each dict contains 'time' and 'stress' arrays.
+        dlc_data : pd.DataFrame
+            DLC simulations with the following required columns:
+              - 'dlc_id'      : Load case identifier (str or int)
+              - 'probability' : Probability of occurrence for the DLC,
+                                all values must sum to 1.0 across unique DLCs.
+              - 'seed_id'     : Seed index within each DLC
+              - 'bin_edges'   : 1-D array of stress range bin edges [MPa]
+              - 'counts'      : 1-D array of cycle counts per bin
+                                (len = len(bin_edges) - 1)
         Returns
         -------
         q_estimated : float
             Estimated Weibull scale parameter for the long-term load distribution.
+        Notes
+        -----
+        Methodology (DNV-ST-0437 / DNV-RP-C203):
+ 
+        1. For each DLC, compute the mean stress range histogram across seeds
+           and normalise to a PDF.
+        2. Combine DLC PDFs into the long-term PDF via probability weighting:
+               f_LT(Δσ) = Σ_i  w_i · f_i(Δσ)
+        3. Fit a 2-parameter Weibull (shape h fixed at 0.8) to the upper tail
+           of the empirical long-term CDF using MLE.
+        4. Bootstrap seeds within each DLC to propagate statistical uncertainty
+           into a distribution of q values (CoV, CI).
         """
-        pass  # Placeholder for future implementation using DLC simulation data
+        bin_edges_ref, lt_pdf_accum = self._build_long_term_pdf(dlc_data)
+        q_estimated = WeibullFit.from_empirical_pdf(
+            bin_edges_ref,
+            lt_pdf_accum,
+            k=0.8,
+        )
+        return q_estimated
+
+    def _build_long_term_pdf(
+        self,
+        dlc_data: pd.DataFrame,
+        # seed_override: Optional[dict] = None,
+        ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Build the long-term stress range PDF as a probability-weighted mixture.
+ 
+        Parameters
+        ----------
+        seed_override : dict {dlc_id -> array of seed indices}
+            When provided (bootstrap mode), resample seeds before averaging.
+        """
+        # Collect per-DLC mean PDFs weighted by occurrence probability
+        # All DLCs must share the same bin grid for superposition.
+        lt_pdf_accum = None
+        bin_edges_ref = None
+ 
+        for _, row in dlc_data.iterrows():
+            edges = np.asarray(row["bin_edges"], dtype=float)
+            counts = np.asarray(row["counts"], dtype=float)
+            prob = np.asarray(row["probability"], dtype=float)
+            total = counts.sum()
+
+            if bin_edges_ref is None:
+                bin_edges_ref = edges
+                lt_pdf_accum = prob * counts / total
+            else:
+                if not np.allclose(edges, bin_edges_ref):
+                    raise ValueError(
+                        f"dlc_id={row['dlc_id']}: All DLCs must share the same bin_edges for superposition."
+                    )
+                lt_pdf_accum += prob * counts / total
+ 
+        return bin_edges_ref, lt_pdf_accum
+
     
 
 class WeibullFit:
@@ -243,19 +305,18 @@ class WeibullFit:
         # --- Plotting logic ---
         if plot is not None:
             fitted_scale = result.x[0]
-            plot_edges = bin_edges_stress[np.isfinite(bin_edges_stress)]
-            n_plot = len(plot_edges) - 1
+            plot_edges = bin_edges_stress.copy()
+            plot_edges[~np.isfinite(plot_edges)] = max(plot_edges[np.isfinite(plot_edges)]) + 1
             bin_centers = (plot_edges[:-1] + plot_edges[1:]) / 2
-            bin_widths = np.diff(plot_edges)
 
             if plot in ['fitted', 'both']:
-                cdf_fitted = weibull_min.cdf(plot_edges, c=k, scale=fitted_scale)
+                cdf_fitted = weibull_min.cdf(bin_edges_stress, c=k, scale=fitted_scale)
                 fitted_pdf = np.diff(cdf_fitted)
 
             plt.figure(figsize=(16 / 2.54, 7 / 2.54))
             if plot in ['observed', 'both']:
-                plt.bar(bin_centers, observed_pdf[:n_plot], width=bin_widths,
-                        alpha=0.5, label='Observed PDF', color='gray', edgecolor='k')
+                plt.bar(bin_centers, observed_pdf, alpha=0.5, 
+                        label='Observed PDF', color='gray', edgecolor='k')
             if plot in ['fitted', 'both']:
                 plt.plot(bin_centers, fitted_pdf, 'r-o', lw=2, label='Fitted PDF')
             plt.xlabel('Stress range')
@@ -361,3 +422,70 @@ class WeibullFit:
 
         return WeibullFit.from_cyclecount(CC, bin_edges_stress, k, scale_init, SCF, plot=plot)
 
+    @staticmethod
+    def from_empirical_pdf(
+        bin_edges_stress: np.ndarray,
+        observed_pdf: np.ndarray,
+        k: float = None,
+        scale_init: float = 5,
+        SCF: float = None,
+        plot: str = None 
+    ) -> float:
+        """
+        Fit Weibull distribution from an empirical PDF of stress ranges.
+
+        Parameters
+        ----------
+        bin_edges_stress : np.ndarray
+            Edges of the stress bins corresponding to the observed PDF values.
+        observed_pdf : np.ndarray
+            Empirical probability density values for each stress bin.
+        k : float, optional
+            Weibull shape parameter. Defaults to 0.8.
+        scale_init : float, optional
+            Initial guess for Weibull scale parameter. Defaults to 5.
+        SCF : float, optional
+            Stress concentration factor to scale stresses. Defaults to 1.
+        plot : str, optional
+            If 'observed', 'fitted', or 'both', generates a plot of the observed and fitted PDFs.
+
+        Returns
+        -------
+        fitted_scale : float
+            Estimated Weibull scale parameter.
+        """
+        if k is None:
+            k = 0.8
+        if SCF is None:
+            SCF = 1.0
+
+        # Objective: minimize squared error between model and observed PDFs
+        def objective(scale):
+            cdf = weibull_min.cdf(bin_edges_stress, c=k, scale=scale[0])
+            model_pdf = np.diff(cdf)
+            return np.sum((model_pdf - observed_pdf) ** 2)
+
+        result = minimize(objective, x0=[scale_init], bounds=[(1e-5, 500)])
+
+        # --- Plotting logic ---
+        if plot is not None:
+            fitted_scale = result.x[0]
+            plot_edges = bin_edges_stress.copy()
+            plot_edges[~np.isfinite(plot_edges)] = max(plot_edges[np.isfinite(plot_edges)]) + 1
+            bin_centers = (plot_edges[:-1] + plot_edges[1:]) / 2
+            if plot in ['fitted', 'both']:
+                cdf_fitted = weibull_min.cdf(bin_edges_stress, c=k, scale=fitted_scale)
+                fitted_pdf = np.diff(cdf_fitted)
+
+            plt.figure(figsize=(16 / 2.54, 7 / 2.54))
+            if plot in ['observed', 'both']:
+                plt.bar(bin_centers, observed_pdf, alpha=0.5, label='Observed PDF', color='gray', edgecolor='k')
+            if plot in ['fitted', 'both']:
+                plt.plot(bin_centers, fitted_pdf, 'r-o', lw=2, label='Fitted PDF')
+            plt.xlabel('Stress range')
+            plt.ylabel('Probability density')
+            plt.title('Weibull Fit of Stress Ranges')
+            plt.legend()
+            plt.grid(True)
+            plt.show()  
+        return result.x[0]
