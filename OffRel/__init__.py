@@ -5,9 +5,9 @@ Utilities for weibull distribution fitting on load data and performing reliabili
 """
 
 from .fatigue_load import WeibullFit, LongtermLoad
-# from .pf_reliability import ParticleFilter
+from .pf_reliability import Reliability
 __all__ = [
     "WeibullFit",
     "LongtermLoad",
-    # "ParticleFilter",
+    "Reliability"
 ]
